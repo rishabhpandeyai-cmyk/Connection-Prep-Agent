@@ -1,41 +1,58 @@
 import streamlit as st
-import requests
-import os
+from transformers import pipeline
 
-st.set_page_config(page_title="Connection Prep Agent", page_icon="🤝")
+# Load summarizer (free, runs via CPU in Streamlit Cloud)
+@st.cache_resource
+def load_summarizer():
+    return pipeline("summarization", model="facebook/bart-large-cnn", device=-1)
+
+summarizer = load_summarizer()
+
+def summarize_text(text: str) -> str:
+    """Summarize text safely by chunking long inputs."""
+    if not text.strip():
+        return "⚠️ Please provide some text to summarize."
+
+    max_chunk = 400
+    sentences = text.split(". ")
+    current_chunk = ""
+    chunks = []
+
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) <= max_chunk:
+            current_chunk += sentence + ". "
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence + ". "
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    summaries = []
+    for chunk in chunks:
+        try:
+            summary = summarizer(
+                chunk,
+                max_new_tokens=120,   # only using max_new_tokens
+                do_sample=False
+            )[0]["summary_text"]
+            summaries.append(summary)
+        except Exception as e:
+            summaries.append(f"[Error on chunk: {e}]")
+
+    return " ".join(summaries)
+
+
+# ----------------- Streamlit UI -----------------
+st.set_page_config(page_title="Connection Prep Agent", layout="centered")
 
 st.title("🤝 Connection Prep Agent")
+st.write("Paste any LinkedIn post, article, or text. I’ll summarize it for quick prep before outreach.")
 
-st.write("Paste LinkedIn posts + meeting goal, and I’ll draft a connection brief for you.")
+user_input = st.text_area("✍️ Paste text to summarize:", height=200)
 
-# Input fields
-posts = st.text_area("Paste 1–3 recent LinkedIn posts from the person:", height=150)
-goal = st.text_area("What’s your meeting goal?", height=100)
-
-# Button
-if st.button("Generate Brief"):
-    if not posts.strip() or not goal.strip():
-        st.warning("Please fill in both fields.")
-    else:
-        with st.spinner("Generating brief..."):
-
-            # Hugging Face Inference API
-            API_URL = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
-            headers = {"Authorization": f"Bearer {os.environ.get('HF_API_TOKEN')}"}
-
-            payload = {
-                "inputs": f"Summarize this person's interests and align with this goal: {goal}\n\nPosts:\n{posts}",
-                "parameters": {"max_length": 200, "temperature": 0.7}
-            }
-
-            response = requests.post(API_URL, headers=headers, json=payload)
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    summary = data[0]['summary_text'] if isinstance(data, list) else data
-                    st.subheader("Brief (Unstructured)")
-                    st.write(summary)
-                except Exception as e:
-                    st.error(f"Unexpected response: {response.text}")
-            else:
-                st.error(f"Error {response.status_code}: {response.text}")
+if st.button("Summarize"):
+    with st.spinner("Summarizing..."):
+        summary = summarize_text(user_input)
+        st.subheader("📌 Summary")
+        st.write(summary)
