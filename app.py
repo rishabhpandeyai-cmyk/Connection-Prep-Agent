@@ -1,278 +1,170 @@
-import json
-import textwrap
-from typing import Dict, List
+# app.py
 import streamlit as st
+import requests
+import json
+from typing import Optional
 
-from transformers import pipeline
+st.set_page_config(page_title="Connection Prep Agent (Free)", page_icon="🤝", layout="wide")
+st.title("🤝 Connection Prep Agent — Free (Hugging Face)")
 
-st.set_page_config(page_title="Connection Prep Agent", page_icon="🤝", layout="wide")
-
-st.title("🤝 Connection Prep Agent")
-st.caption("Paste a LinkedIn profile (and optionally their recent posts) to get a 1‑page meeting brief. "
-           "All analysis runs locally in this app using open-source models. No scraping, no automation.")
-
-with st.expander("How to use (and what's legal)", expanded=False):
-    st.markdown("""
-- **Copy-paste** the profile text you can already view on LinkedIn (About, Experience, Skills, Education).
-- Optionally paste **their recent posts** (copy a few posts or highlights).
-- Click **Generate Brief**. The app runs open-source language models to create a one‑pager.
-- This is **legal** because you're only analyzing content you can access, with no bots or scraping.
-- For privacy, don't paste confidential data.
-    """)
-
-# Sidebar: settings
-st.sidebar.header("Settings")
-engine = st.sidebar.selectbox(
-    "Engine (choose smaller if you're on low memory)",
-    [
-        "Fast (FLAN-T5-small + DistilBART)",
-        "Quality (FLAN-T5-base + DistilBART)",
-        "Summarization‑only (fastest, least smart)",
-    ],
-    index=0
+st.markdown(
+    "Paste a LinkedIn profile (About/Experience) and optionally 1–3 recent posts. "
+    "This app uses free Hugging Face models. **Do not commit API tokens** to GitHub."
 )
 
-max_output_bullets = st.sidebar.slider("Max bullets per section", 3, 12, 6)
-include_agenda = st.sidebar.checkbox("Include meeting agenda suggestions", value=True)
-include_dm_email = st.sidebar.checkbox("Include sample DM + email subject", value=True)
+# ---------------------------
+# Helper to call Hugging Face Inference API
+# ---------------------------
+def hf_call(model_id: str, inputs: str, hf_token: str, params: Optional[dict] = None):
+    if not hf_token:
+        raise ValueError("Hugging Face token not found. Set HF_TOKEN in Streamlit secrets.")
+    API_URL = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    payload = {"inputs": inputs}
+    if params:
+        payload["parameters"] = params
+    resp = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+    if resp.status_code != 200:
+        # return the error body for debugging
+        raise RuntimeError(f"HF API error {resp.status_code}: {resp.text}")
+    return resp.json()
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Tips")
-st.sidebar.markdown("""
-- If you hit **out of memory** on free hosting, switch to **Summarization‑only** or **Fast** engine.
-- Shorter input → faster & better output.
-- Paste 1–3 recent posts, not 20.
-""")
+# ---------------------------
+# UI Inputs
+# ---------------------------
+with st.expander("How to use (quick)"):
+    st.write(
+        "- Copy-paste the public LinkedIn text you can view (About / Experience / Headline)."
+        "- Optionally paste 1–3 recent post texts."
+        "- Add a short meeting goal (e.g., 'Intro call about product partnership')."
+        "- Click Generate Brief. The app calls free HF models (you must add a HF token in Streamlit secrets)."
+    )
 
-# Lazy-load models
-@st.cache_resource(show_spinner=True)
-def load_models(engine_name: str):
-    if engine_name == "Summarization‑only (fastest, least smart)":
-        summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-        generator = None
-    elif engine_name == "Quality (FLAN-T5-base + DistilBART)":
-        summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-        generator = pipeline("text2text-generation", model="google/flan-t5-base")
-    else:
-        summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-        generator = pipeline("text2text-generation", model="google/flan-t5-small")
-    return summarizer, generator
+col1, col2 = st.columns([2,1])
+with col1:
+    profile_text = st.text_area("LinkedIn Profile (About / Experience / Headline)", height=200,
+                                placeholder="Paste the person's About / headline / experience here.")
+    posts_text = st.text_area("Recent posts (optional) — 1–3 posts (short)", height=160,
+                              placeholder="Paste 1–3 short recent posts (optional).")
+    meeting_goal = st.text_input("Meeting goal (optional)", placeholder="E.g., 'Intro: explore partnership'")
 
-def chunk_text(s: str, chunk_size: int = 1600, overlap: int = 150) -> List[str]:
-    s = s.strip()
-    if not s:
-        return []
-    chunks = []
-    start = 0
-    n = len(s)
-    while start < n:
-        end = min(start + chunk_size, n)
-        chunk = s[start:end]
-        chunks.append(chunk)
-        if end == n:
-            break
-        start = end - overlap
-        if start < 0:
-            start = 0
-    return chunks
+with col2:
+    st.header("Settings")
+    summarizer_model = st.selectbox("Summarizer model (smaller = faster):",
+                                    ["sshleifer/distilbart-cnn-12-6", "facebook/bart-large-cnn"])
+    generator_model = st.selectbox("Generator model (instruction):",
+                                   ["google/flan-t5-small", "google/flan-t5-base"])
+    bullets = st.slider("Max bullets per list", 3, 8, 5)
+    st.caption("If the app fails due to resource limits, choose the smaller models and shorter inputs.")
 
-def summarize_long_text(summarizer, text: str, max_len: int = 220, min_len: int = 80) -> str:
-    if not text or not text.strip():
-        return ""
-    parts = chunk_text(text, 1600, 150)
-    summaries = []
-    for p in parts:
-        out = summarizer(p, max_length=max_len, min_length=min_len, do_sample=False)
-        summaries.append(out[0]["summary_text"])
-    if len(summaries) == 1:
-        return summaries[0]
-    # Merge summaries into a final summary
-    merged = " ".join(summaries)
-    final = summarizer(merged, max_length=max_len, min_length=min_len, do_sample=False)[0]["summary_text"]
-    return final
+# ---------------------------
+# Get HF token from Streamlit secrets (secure)
+# ---------------------------
+hf_token = None
+try:
+    # Streamlit secrets: Add a secret named HF_TOKEN in Streamlit app settings
+    hf_token = st.secrets["HF_TOKEN"]
+except Exception:
+    hf_token = None
 
-def generate_brief(profile_text: str, posts_text: str, goal_text: str, engine_name: str,
-                   bullets: int, include_agenda: bool, include_dm_email: bool) -> Dict:
-    summarizer, generator = load_models(engine_name)
+# ---------------------------
+# Generate Brief logic
+# ---------------------------
+def make_prompt(profile_summary: str, posts_summary: str, goal: str, bullets: int):
+    prompt = f"""
+You are a concise assistant creating a one-page connection/meeting brief for a professional networking call.
+Use the inputs below to produce clearly labeled sections. Keep language neutral, factual, and useful.
 
-    # Compact versions of inputs
-    profile_sum = summarize_long_text(summarizer, profile_text, 220, 80) if profile_text else ""
-    posts_sum = summarize_long_text(summarizer, posts_text, 150, 60) if posts_text else ""
-    goal_sum = goal_text.strip()
+PROFILE_SUMMARY:
+{profile_summary}
 
-    if generator is None:
-        # Summarization-only fallback: heuristic brief
-        brief = {
-            "profile_snapshot": profile_sum[:700],
-            "top_skills": [],
-            "domain_knowledge": [],
-            "mutual_interests": [],
-            "talking_points": [posts_sum] if posts_sum else [],
-            "icebreakers": [],
-            "opening_question": "",
-            "sample_dm": "",
-            "email_subject": "",
-            "meeting_agenda": []
-        }
-        return brief
+POSTS_SUMMARY:
+{posts_summary}
 
-    # Instruction to the generator model
-    template = f"""
-You are an assistant that prepares a crisp, tactful 1‑page meeting brief based on a LinkedIn profile and (optional) recent posts.
-Return **only valid JSON** with the following keys:
+MEETING_GOAL:
+{goal}
 
-- profile_snapshot: 3 short lines summarizing the person's seniority, domain, and value focus.
-- top_skills: up to {bullets} bullet phrases of key skills or tools (short, no sentences).
-- domain_knowledge: up to {bullets} bullet phrases of industry/functional expertise.
-- mutual_interests: infer 3–{max(3, min(bullets, 6))} items from education, locations, groups, or interests.
-- talking_points: up to {bullets} specific, positive topics to discuss based on their posts/activities (if posts provided).
-- icebreakers: 3–5 friendly openers tailored to the person.
-- opening_question: one smart, respectful, open-ended question.
-{"- sample_dm: 2–3 sentence LinkedIn DM to request a short chat." if include_dm_email else ""}
-{"- email_subject: short subject line for an intro email." if include_dm_email else ""}
-{"- meeting_agenda: 3–5 bullet agenda items for a 15–30 min call." if include_agenda else ""}
+Produce the output with these labeled sections and bullet lists:
 
-Write concise items. Be specific and avoid generic fluff.
-If not enough info, make reasonable, neutral inferences. Do not hallucinate company names or facts not present.
+PROFILE SNAPSHOT:
+- 3 short lines about seniority, domain, value-focus.
 
-INPUT:
-[PROFILE]
-{profile_text}
+TOP SKILLS:
+- Up to {bullets} short bullets (skill/tool names).
 
-[PROFILE_SUMMARY]
-{profile_sum}
+TALKING POINTS:
+- Up to {bullets} actionable topics based on posts/profile.
 
-[RECENT_POSTS_SUMMARY]
-{posts_sum}
+ICEBREAKERS:
+- 3 friendly openers tailored to the person.
 
-[MEETING_GOAL]
-{goal_sum}
+OPENING_QUESTION:
+- One smart open-ended question.
+
+SAMPLE_DM:
+- A 2–3 sentence LinkedIn DM to request a short chat.
+
+MEETING_AGENDA:
+- 3 bullets for a 15–30 minute call.
+
+If information is missing, be conservative and generic. Do not invent companies or facts.
 """
-    raw = generator(template, max_length=768, do_sample=False)[0]["generated_text"]
+    return prompt.strip()
 
-    # Try to parse JSON defensively
-    def extract_json(s: str) -> Dict:
-        s = s.strip()
-        # Find the first { ... } block
-        start = s.find("{")
-        end = s.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            s = s[start:end+1]
-        try:
-            return json.loads(s)
-        except Exception:
-            # Last resort: lightweight fixes
-            s = s.replace("\n- ", "\n")
-            s = s.replace("—", "-").replace("–", "-")
-            try:
-                return json.loads(s)
-            except Exception:
-                return {"raw_text": s}
+def generate_brief(profile_text, posts_text, goal, hf_token):
+    # Short-circuit if no token
+    if not hf_token:
+        return {"error": "No Hugging Face token found. Add HF_TOKEN to Streamlit secrets (see app instructions)."}
 
-    return extract_json(raw)
+    # 1) Summarize profile and posts using the summarizer model
+    profile_summary = ""
+    posts_summary = ""
+    try:
+        if profile_text.strip():
+            out = hf_call(summarizer_model, profile_text, hf_token,
+                          params={"max_new_tokens": 150})
+            # HF summarizers return [{'summary_text': "..."}]
+            if isinstance(out, list) and "summary_text" in out[0]:
+                profile_summary = out[0]["summary_text"]
+            elif isinstance(out, dict) and "summary_text" in out:
+                profile_summary = out["summary_text"]
+            else:
+                profile_summary = profile_text[:400]
+        if posts_text.strip():
+            out2 = hf_call(summarizer_model, posts_text, hf_token, params={"max_new_tokens": 120})
+            if isinstance(out2, list) and "summary_text" in out2[0]:
+                posts_summary = out2[0]["summary_text"]
+            else:
+                posts_summary = posts_text[:300]
+    except Exception as e:
+        return {"error": f"Summarization failed: {e}"}
 
-# ---------- UI ----------
+    # 2) Use generator model to create the structured brief
+    prompt = make_prompt(profile_summary, posts_summary, goal, bullets)
+    try:
+        gen_out = hf_call(generator_model, prompt, hf_token,
+                          params={"max_new_tokens": 400, "temperature": 0.2})
+        # HF text2text usually returns [{"generated_text": "..."}] or plain text
+        if isinstance(gen_out, list) and "generated_text" in gen_out[0]:
+            text = gen_out[0]["generated_text"]
+        elif isinstance(gen_out, dict) and "generated_text" in gen_out:
+            text = gen_out["generated_text"]
+        else:
+            # some models return string directly
+            text = json.dumps(gen_out)
+    except Exception as e:
+        return {"error": f"Generation failed: {e}"}
 
-st.subheader("Paste Inputs")
-profile_text = st.text_area("LinkedIn Profile Text (About, Experience, Skills, Education)", height=240,
-                            placeholder="Copy-paste text from a LinkedIn profile you can view.")
-posts_text = st.text_area("Recent Posts or Highlights (optional)", height=160,
-                          placeholder="Paste 1–3 recent posts, or key highlights.")
-goal_text = st.text_input("Meeting Context/Goal (optional)",
-                          placeholder="e.g., 'First intro chat about AI in Customer Success'")
+    return {"brief": text, "profile_summary": profile_summary, "posts_summary": posts_summary}
 
-col_run, col_clear = st.columns([1,1])
-with col_run:
-    run = st.button("🚀 Generate Brief", type="primary")
-with col_clear:
-    if st.button("🧹 Clear All"):
-        st.experimental_rerun()
+# Run generation on button click
+if st.button("🚀 Generate Brief"):
+    with st.spinner("Working..."):
+        result = generate_brief(profile_text, posts_text, meeting_goal, hf_token)
 
-if run:
-    with st.spinner("Thinking..."):
-        brief = generate_brief(profile_text, posts_text, goal_text, engine,
-                               max_output_bullets, include_agenda, include_dm_email)
-
-    st.success("Brief ready! Scroll down to view and download.")
-    st.divider()
-
-    # Render brief nicely
-    def as_markdown(b: Dict) -> str:
-        def join_bullets(key: str) -> str:
-            arr = b.get(key, []) or []
-            if isinstance(arr, str):
-                arr = [arr]
-            arr = [str(x).strip() for x in arr if str(x).strip()]
-            return "".join([f"- {x}\n" for x in arr])
-
-        md = f"""# Connection Prep Brief
-
-**Snapshot**  
-{b.get('profile_snapshot','').strip()}
-
-## Top Skills
-{join_bullets('top_skills')}
-
-## Domain Knowledge
-{join_bullets('domain_knowledge')}
-
-## Mutual Interests
-{join_bullets('mutual_interests')}
-
-## Talking Points
-{join_bullets('talking_points')}
-
-## Icebreakers
-{join_bullets('icebreakers')}
-
-**Opening question:** {b.get('opening_question','').strip()}
-
-"""
-        if 'sample_dm' in b and b.get('sample_dm'):
-            md += f"## Sample LinkedIn DM\n{b['sample_dm'].strip()}\n\n"
-        if 'email_subject' in b and b.get('email_subject'):
-            md += f"**Email subject:** {b['email_subject'].strip()}\n\n"
-        if 'meeting_agenda' in b and b.get('meeting_agenda'):
-            md += f"## Suggested Agenda\n{join_bullets('meeting_agenda')}\n"
-        return md
-
-    # If model returned raw text, display as-is
-    if "raw_text" in brief:
-        st.subheader("Brief (Unstructured)")
-        st.write(brief["raw_text"])
-        md_content = brief["raw_text"]
+    if "error" in result:
+        st.error(result["error"])
     else:
-        st.subheader("Brief")
-        cols = st.columns(2)
-        with cols[0]:
-            st.markdown(f"**Snapshot:**\n\n{brief.get('profile_snapshot','')}")
-            st.markdown("**Top Skills:**")
-            st.write(brief.get("top_skills", []))
-            st.markdown("**Domain Knowledge:**")
-            st.write(brief.get("domain_knowledge", []))
-            st.markdown("**Mutual Interests:**")
-            st.write(brief.get("mutual_interests", []))
-        with cols[1]:
-            st.markdown("**Talking Points:**")
-            st.write(brief.get("talking_points", []))
-            st.markdown("**Icebreakers:**")
-            st.write(brief.get("icebreakers", []))
-            st.markdown("**Opening Question:**")
-            st.write(brief.get("opening_question", ""))
-            if 'sample_dm' in brief:
-                st.markdown("**Sample LinkedIn DM:**")
-                st.write(brief.get("sample_dm", ""))
-            if 'email_subject' in brief:
-                st.markdown("**Email Subject:**")
-                st.write(brief.get("email_subject", ""))
-            if 'meeting_agenda' in brief:
-                st.markdown("**Suggested Agenda:**")
-                st.write(brief.get("meeting_agenda", []))
-
-        md_content = as_markdown(brief)
-
-    st.download_button("⬇️ Download as Markdown", data=md_content, file_name="connection_prep_brief.md")
-    st.caption("Tip: You can paste the Markdown into Notion/Docs or convert to PDF.")
-
-st.markdown("---")
-st.markdown("Made with ❤️ using Streamlit + Transformers (open-source).")
+        st.subheader("📄 Connection Prep Brief")
+        st.markdown(result["brief"])
+        st.download_button("⬇️ Download as Markdown", result["brief"], file_name="connection_prep_brief.md")
